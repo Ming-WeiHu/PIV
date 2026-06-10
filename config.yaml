@@ -1,0 +1,97 @@
+# piv_pipeline/config.yaml
+# ---------------------------------------------------------------------------
+# Replaces the MATLAB inputdlg() prompt from PIV_Pipeline_Master.m.
+# Edit before running, or override on the CLI:
+#   python -m piv_pipeline.piv_pipeline_master --input-dir "..." --fps 500
+# ---------------------------------------------------------------------------
+
+# Camera frames per second
+fps: 500
+
+# Vessel centre in PIXELS (from the calibration image)
+centre_x: 545
+centre_y: 481
+
+# Stage 2 (dynamic masking) — per-frame fluid detection method.
+#   'brightness' — smooth + percentile threshold. Default. Validated on
+#                  100mL-20deg-35cpm data. Works with keep_pct override and
+#                  uniform_floor safety net (see below).
+#   'tophat'     — top-hat + Otsu. For sparse bright particles on varying
+#                  backgrounds where mean intensity isn't separable.
+#   'texture'    — local std + Otsu. Polarity-agnostic.
+#   'simple'     — smooth + manual threshold (no auto-tuning).
+#   'deviation'  — |smoothed - median|. Catches dense + sparse regions.
+#   'intensity'  — original MATLAB algorithm (rarely useful for our data).
+#----------------------------------------------------------------------------------------------------
+#brightness method
+
+#mask_method: brightness
+
+# For Otsu-based methods (brightness/tophat): how much of each frame to keep.
+#   null — auto via Otsu (fragile on unimodal histograms — can invert)
+#   68   — keep top 68% (our final tuned value for the 100mL data)
+#   70   — keep top 70% (more permissive)
+#mask_keep_pct: 68
+
+# Kernel sizes (in pixels at full TIF resolution).
+#   mask_particle_ksize — smoothing/opening kernel.
+#                         0 = NO smoothing (raw pixel threshold). Our final
+#                         choice — preserves pixel-sized microcarriers.
+#                         15 default for general PIVlab-style data.
+#   mask_region_ksize   — smoothing for top-hat response map. (tophat only)
+#mask_particle_ksize: 0
+#mask_region_ksize: 31
+
+# Uniform-frame safety net (applies to all Otsu-based methods).
+# If a frame's pixel std is below this value, the per-frame mask is set
+# to all-True (keep everything) instead of letting Otsu pick a degenerate
+# split. Right for frames where particles are evenly distributed.
+#   0     — disabled
+#   16086 — our final tuned value for the 100mL data (uint16 std units)
+#mask_uniform_floor: 16086
+
+# Morphological cleanup kernels (px). 0 disables either step.
+#   mask_open_ksize  — removes specks smaller than this. MATLAB default 7.
+#   mask_close_ksize — fills gaps smaller than this. MATLAB default 41.
+#mask_open_ksize: 7
+#mask_close_ksize: 41
+#----------------------------------------------------------------------------------------------------
+
+#current simple working method
+mask_method: simple 
+mask_particle_ksize: 0
+mask_threshold: 202
+mask_direction: above
+mask_open_ksize: 20
+mask_close_ksize: 0
+
+
+
+# Intensity threshold (only used when mask_method='intensity').
+lower_bound: 114.42
+
+# Vessel radius in METRES
+R: 0.0691
+
+# Averaging window in frames (AA-frame moving average over u, v)
+AA: 10
+
+# Smoothing window for Stage 4 moving-average over time series
+span: 50
+
+# Scaling correction for the legacy PIVlab calibration glitch.
+#   1  — normal case (or any .npz input from piv_simple.py)
+#   10 — PIVlab exported with the known "10x off" calibration bug
+howstupid: 1
+
+# Convert pixel/frame velocities to m/s before computing gradients.
+#   true  — compute shear from m/s velocities over metres
+#   false — preserve legacy px/frame units for comparison/debugging
+convert_velocity: true
+
+# How to fill masked / capped NaN holes before taking gradients.
+#   interpolate — PIVlab-style: interpolate holes inside the mask from
+#                 neighbours. Avoids the artificial 0-edge gradients that
+#                 zero-fill creates at capped/masked cells. (default)
+#   zero        — legacy MATLAB-port behaviour (NaN -> 0).
+nan_fill: interpolate
