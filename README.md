@@ -105,7 +105,7 @@ Python pipeline (masked, interpolate, no cap) gives ~7.2 1/s vs MATLAB tertiary 
 
 ## Dependencies
 
-Install into the `ORI` conda environment:
+Install into the Python environment:
 
 ```
 numpy
