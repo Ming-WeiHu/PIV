@@ -118,9 +118,3 @@ tkinter  (stdlib)
 ```
 
 ---
-
-## Notes
-
-- This PIV pipeline is **independent** from the bioreactor particle analyzer (`gui.py` / `particle_testing.py`). Do not mix them.
-- The canonical working branch is `claude/piv-consolidated`.
-- MATLAB Secondary Export reference file: `100mL-20deg-35cpm_Secondary_Export.mat` (v7.3 HDF5). S33 shape in h5py is `(frames, cols, rows)` — transpose to `(rows, cols, frames)` before use.
