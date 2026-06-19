@@ -161,13 +161,13 @@ class PIVSettings:
     velocity_cap_fraction: Optional[float] = None
     velocity_cap_percentile: Optional[float] = 0.7
 
-    # ── smoothn — PIVlab-style field smoothing ───────────────────────────────
-    # Smooth the u/v field at the end of every pass with Garcia's smoothn
-    # (non-robust; validation is already done by _replace_outliers).
-    # PIVlab uses s=4 on intermediate passes, but that value is MATLAB-scale
-    # and over-smooths in the Python port → inflates the predictor → higher
-    # final velocities. Auto-GCV (s=None) on every pass self-calibrates.
-    # Independent of the velocity cap; toggle either to A/B their effect.
+    # ── smoothn — WIP, off by default ───────────────────────────────────────
+    # Garcia (2010) DCT smoother, same algorithm PIVlab uses per-pass.
+    # OFF by default — in a heavily masked field the DCT solver extrapolates
+    # into masked boundary regions and inflates velocities in adjacent valid
+    # cells, raising shear rather than reducing it. Root cause: PIVlab masks
+    # post-hoc (nearly-full field when smoothn runs); this pipeline masks
+    # during PIV (large NaN regions). Use the velocity cap for production runs.
     enable_smoothn: bool = False
 
 
@@ -774,8 +774,9 @@ def _apply_smoothn(u: np.ndarray, v: np.ndarray,
         if not finite.any():
             out.append(comp)
             continue
+        W = finite.astype(float)
         with contextlib.redirect_stdout(io.StringIO()):
-            z = smoothn(comp, s=s, isrobust=False)[0]
+            z = smoothn(comp, W=W, s=s, isrobust=False)[0]
         z = np.asarray(z, dtype=float)
         z[~finite] = np.nan          # keep masked windows masked
         out.append(z)

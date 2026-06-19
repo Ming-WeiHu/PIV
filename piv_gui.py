@@ -640,11 +640,10 @@ class PIVGUI:
         ttk.Label(row, text="or top % of each |u|/|v| (used when px=0):").pack(side="left")
         ttk.Entry(row, textvariable=self.cap_percentile, width=6).pack(side="left", padx=4)
 
-        # Field smoothing — PIVlab-style robust smoothn on the final field
-        # (independent of the cap; toggle either to compare their effect).
-        sm = ttk.LabelFrame(outer, text="Field smoothing (smoothn)")
+        # Field smoothing — WIP, inflates velocities in masked domains, off by default
+        sm = ttk.LabelFrame(outer, text="Field smoothing (smoothn) — WIP")
         sm.pack(fill="x", padx=4, pady=4)
-        ttk.Checkbutton(sm, text="Per-pass smoothn (PIVlab-style: s=4, auto last pass)",
+        ttk.Checkbutton(sm, text="Per-pass smoothn [WIP — inflates velocities in masked domains, do not use for final results]",
                         variable=self.smoothn_enabled).pack(anchor="w", padx=6, pady=4)
 
         # Batch (multi-condition pipeline)
