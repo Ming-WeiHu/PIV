@@ -97,13 +97,13 @@ Shear (`TimeAvg_mean`) is driven by **masking**, not by the `nan_fill` setting. 
 Use `nan_fill: interpolate` (default) — this matches PIVlab's own approach.
 
 ### Velocity cap
-The Python PIV implementation produces a spurious high-velocity tail not present in PIVlab's output — a translation artifact from differences in correlation normalisation and sub-pixel estimation. This tail inflates the shear estimate. The velocity cap is on by default to suppress it: it drops the top 0.7% of each component (|u| and |v| independently, computed per frame-pair) and rejects a whole vector when either exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags --velocity-cap-percentile / --velocity-cap-px / --no-velocity-cap.
+The Python PIV implementation produces a spurious high-velocity tail not present in PIVlab's output — a translation artifact from differences in correlation normalisation and sub-pixel estimation. This tail inflates the shear estimate. The velocity cap is **on by default** to suppress it: it drops the top 0.7% of each component (`|u|` and `|v|` independently, computed **per frame-pair**) and rejects a whole vector when **either** exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags `--velocity-cap-percentile` / `--velocity-cap-px` / `--no-velocity-cap`.
 
-### Field smoothing (smoothn)
-PIVlab smooths the velocity field at the end of **every pass** (before the next image deformation), and this matches its `+piv/piv_FFTmulti.m`: non-robust Garcia `smoothn` with a fixed `s=4` on intermediate passes and auto-GCV on the last pass (the last-pass smoothed field is what's exported). `piv_simple.py` mirrors this exactly via `smoothn.py`, applied after the per-pass outlier replacement (so it's deliberately **non-robust** — validation is already done upstream). It suppresses spurious high-velocity vectors at their source rather than clipping them like the cap. **On by default** (`PIVSettings.enable_smoothn`), independent of the velocity cap — toggle either (GUI checkbox) to A/B their effect on shear.
+### Field smoothing (smoothn) — WIP, do not use for final results
+`smoothn.py` is a vendored port of Garcia (2010)'s DCT-based smoother, the same algorithm PIVlab uses per-pass. **Off by default and not production-ready.** In a heavily masked field (large NaN regions at vessel walls), the DCT solver extrapolates into masked boundaries and inflates velocities in adjacent valid cells — consistently raising peak velocities and shear rather than reducing them. Root cause: PIVlab applies masking post-hoc so smoothn runs on a nearly-full field; this Python pipeline masks during PIV, creating large NaN regions that the smoother mishandles. Use the velocity cap for production runs.
 
 ### Python vs MATLAB shear gap
-Python pipeline (masked, interpolate, no cap) gave ~7.2 1/s vs MATLAB tertiary 6.55 1/s (~10% gap), shrinking to ~10% with the cap on. The gap responds to *capping* — i.e. it's driven by an upper **tail** of spurious vectors (concentrated in `|v|`), not a uniform conversion-factor error. The faithful `smoothn` port above is the principled fix (it's what PIVlab does to clean that tail); the velocity cap remains as a separate, blunter workaround. **A/B not yet measured** — regenerate a primary with smoothn on/off and compare pipeline `TimeAvg_mean` to the 6.55 baseline to confirm.
+Python pipeline (masked, interpolate, no cap) gives ~7.2 1/s vs MATLAB ~6.55 1/s (~10% gap). The gap is driven by an upper tail of spurious vectors — applying the default 0.7% velocity cap brings results to within 10% of MATLAB.
 
 ---
 
@@ -120,6 +120,9 @@ openpiv
 matplotlib
 tkinter  (stdlib)
 ```
+<<<<<<< HEAD
 
 ---
 
+=======
+>>>>>>> e848bdc (Fix README: correct cap explanation, smoothn WIP, cap closes MATLAB gap)
