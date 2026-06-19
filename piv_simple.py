@@ -41,10 +41,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
+import contextlib
+import io
+
 import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter, map_coordinates, median_filter
 from scipy.signal import wiener
+
+# Garcia's robust smoothn (PIVlab-style field smoothing), vendored alongside
+# this module. Make the sibling import work whether piv_simple is run as a
+# script or imported from another working directory.
+try:
+    from smoothn import smoothn
+except ImportError:  # pragma: no cover - path fallback
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from smoothn import smoothn
 
 # Silence libtiff metadata warnings (e.g. "Software" tag with embedded null
 # bytes) that OpenCV routes to stderr on every imread. The pixel data is
@@ -129,22 +143,32 @@ class PIVSettings:
     median_filter_size: int = 3
     outlier_threshold: float = 2.0         # multiples of local median absolute deviation
 
-    # ── Velocity cap (outlier-vector rejection on |v|) ───────────────────────
-    # Rejects whole vectors whose VERTICAL speed |v| exceeds a cap, removing
-    # the spurious large-displacement tail that cyclic-FFT wrap-around emits
-    # (which inflates the vertical mean). When |v| > cap, BOTH u and v at that
-    # cell are NaN'd, in the filtered and `_original` fields — the same
-    # whole-vector removal the cap-explorer export performed.
+    # ── Velocity cap (outlier-vector rejection on |u| OR |v|) ────────────────
+    # Rejects whole vectors whose speed on EITHER component exceeds a cap,
+    # removing the spurious large-displacement tail that cyclic-FFT wrap-around
+    # emits. A vector is removed (BOTH u and v at that cell NaN'd, in the
+    # filtered and `_original` fields) when |u| > u-cap OR |v| > v-cap — the
+    # same whole-vector, both-component removal the GUI cap-finder performs.
     # Three ways to set the cap, in precedence order:
-    #   velocity_cap_px         — absolute |v| cap in PIXELS/FRAME
+    #   velocity_cap_px         — absolute cap in PIXELS/FRAME (applied to both)
     #   velocity_cap_fraction   — cap = fraction × smallest interrogation window
-    #   velocity_cap_percentile — drop the top X% of vectors by |v|
-    # Default: absolute 5.4 px/frame (≈428 mm/s at calv=0.0795), the validated
-    # global |v| cut from the cap explorer (~0.7% of the 100mL-35cpm data).
-    # Set all three to None to disable.
-    velocity_cap_px: Optional[float] = 5.4
+    #   velocity_cap_percentile — drop the top X% of EACH component (|u|, |v|)
+    # Enabled by default at the 0.7% percentile (the validated cut from the cap
+    # explorer, ~5.4 px/frame ≈428 mm/s on |v| for the 100mL-35cpm data). The
+    # percentile is computed per-frame-pair, per component. Set all three to
+    # None to disable; the GUI also exposes a toggle.
+    velocity_cap_px: Optional[float] = None
     velocity_cap_fraction: Optional[float] = None
-    velocity_cap_percentile: Optional[float] = None
+    velocity_cap_percentile: Optional[float] = 0.7
+
+    # ── smoothn — PIVlab-style field smoothing ───────────────────────────────
+    # Smooth the u/v field at the end of every pass with Garcia's smoothn
+    # (non-robust; validation is already done by _replace_outliers).
+    # PIVlab uses s=4 on intermediate passes, but that value is MATLAB-scale
+    # and over-smooths in the Python port → inflates the predictor → higher
+    # final velocities. Auto-GCV (s=None) on every pass self-calibrates.
+    # Independent of the velocity cap; toggle either to A/B their effect.
+    enable_smoothn: bool = False
 
 
 @dataclass
@@ -640,7 +664,7 @@ def multipass_piv(frame_a: np.ndarray, frame_b: np.ndarray,
 
     u_pre = v_pre = None  # captured at the end of the final pass
 
-    def _run_pass(ws, st, acc_u, acc_v):
+    def _run_pass(ws, st, acc_u, acc_v, is_last_pass=False):
         # Deform B with the running estimate. nan_to_num the warp field so
         # masked NaNs in (u, v) don't propagate to the warped pixels.
         if acc_u is None:
@@ -680,29 +704,44 @@ def multipass_piv(frame_a: np.ndarray, frame_b: np.ndarray,
                 settings.median_filter_size, settings.outlier_threshold,
             )
 
+        # PIVlab-style smoothn at the end of each pass (before this field is
+        # upsampled to deform the next pass). Uses auto-GCV (s=None) on every
+        # pass — PIVlab hardcodes s=4 on intermediate passes but that value is
+        # MATLAB-scale and maps to over-smoothing in the Python port, which
+        # inflates the accumulated predictor and raises final velocities.
+        # Auto-GCV is self-calibrating and avoids the scale mismatch.
+        if settings.enable_smoothn:
+            u2, v2 = _apply_smoothn(u2, v2, s=None)
+
         new_acc_u, new_acc_v = _upsample_to_pixel_grid(
             x_c2, y_c2, u2, v2, frame_a.shape)
         return (x_c2, y_c2, u2, v2, u_unfiltered, v_unfiltered,
                 new_acc_u, new_acc_v)
 
-    for ws, st in zip(settings.window_sizes, settings.steps):
+    n_passes = len(settings.window_sizes)
+    for i, (ws, st) in enumerate(zip(settings.window_sizes, settings.steps)):
         (x_c, y_c, u, v, u_pre, v_pre,
          accumulated_u_pixel, accumulated_v_pixel) = _run_pass(
-            ws, st, accumulated_u_pixel, accumulated_v_pixel)
+            ws, st, accumulated_u_pixel, accumulated_v_pixel,
+            is_last_pass=(i == n_passes - 1))
 
-    # Repeat-last-pass loop.
+    # Repeat-last-pass loop — these re-run the final pass (auto-GCV smoothn).
     if settings.repeat_last_pass:
         ws, st = settings.window_sizes[-1], settings.steps[-1]
         prev_mean_mag = float(np.nanmean(np.hypot(u, v)))
         for _ in range(settings.repeat_max_iterations):
             (x_c, y_c, u, v, u_pre, v_pre,
              accumulated_u_pixel, accumulated_v_pixel) = _run_pass(
-                ws, st, accumulated_u_pixel, accumulated_v_pixel)
+                ws, st, accumulated_u_pixel, accumulated_v_pixel,
+                is_last_pass=True)
             mean_mag = float(np.nanmean(np.hypot(u, v)))
             slope = abs(mean_mag - prev_mean_mag) / max(mean_mag, 1e-6)
             prev_mean_mag = mean_mag
             if slope < settings.quality_slope_threshold:
                 break
+
+    # smoothn is applied per-pass inside _run_pass (matching PIVlab); the
+    # returned u/v are already the smoothed last-pass field.
 
     # ── Velocity cap — drop whole vectors above the |v| limit ───────────────
     u, v = _apply_velocity_cap(settings, u, v)
@@ -714,29 +753,66 @@ def multipass_piv(frame_a: np.ndarray, frame_b: np.ndarray,
     return x_c, y_c, u, v
 
 
+def _apply_smoothn(u: np.ndarray, v: np.ndarray,
+                   s: Optional[float] = None
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+    """PIVlab-style smoothing of a vector field (one pass).
+
+    Non-robust Garcia smoothn (validation already done upstream). Uses
+    auto-GCV (`s=None`) on every pass — PIVlab hardcodes `s=4` on
+    intermediate passes but that value over-smooths in the Python port,
+    inflating the predictor and raising final velocities.
+
+    NaN cells (masked / removed vectors) are treated as missing by smoothn and
+    restored to NaN afterwards so masked regions never leak downstream.
+    smoothn's GCV notices print to stdout, so they are suppressed here to
+    avoid per-frame spam during batch runs.
+    """
+    out = []
+    for comp in (u, v):
+        finite = np.isfinite(comp)
+        if not finite.any():
+            out.append(comp)
+            continue
+        with contextlib.redirect_stdout(io.StringIO()):
+            z = smoothn(comp, s=s, isrobust=False)[0]
+        z = np.asarray(z, dtype=float)
+        z[~finite] = np.nan          # keep masked windows masked
+        out.append(z)
+    return out[0], out[1]
+
+
 def _apply_velocity_cap(settings: PIVSettings,
                         u: np.ndarray, v: np.ndarray
                         ) -> Tuple[np.ndarray, np.ndarray]:
-    """NaN whole vectors whose vertical speed |v| exceeds the configured cap.
+    """NaN whole vectors whose speed on either component exceeds the cap.
 
-    Matches the cap-explorer export: a vector is removed (both u and v → NaN)
-    when |v| > cap. The cap (px/frame) comes from `velocity_cap_px` (absolute),
-    else `velocity_cap_fraction` × smallest window, else the per-array
-    `velocity_cap_percentile` of |v|. Returns (u, v) with bad cells NaN'd.
+    Matches the GUI cap-finder export: a vector is removed (both u and v → NaN)
+    when |u| > u-cap OR |v| > v-cap. The cap (px/frame) comes from
+    `velocity_cap_px` (absolute, applied to both components), else
+    `velocity_cap_fraction` × smallest window, else the per-array, per-component
+    `velocity_cap_percentile` of |u| and |v| separately. Returns (u, v) with
+    bad cells NaN'd.
     """
+    umag = np.abs(u)
     vmag = np.abs(v)
-    cap = float("inf")
+    ucap = vcap = float("inf")
     if settings.velocity_cap_px is not None:
-        cap = float(settings.velocity_cap_px)
+        ucap = vcap = float(settings.velocity_cap_px)
     elif settings.velocity_cap_fraction is not None and settings.window_sizes:
-        cap = float(settings.velocity_cap_fraction) * float(min(settings.window_sizes))
+        ucap = vcap = float(settings.velocity_cap_fraction) * float(min(settings.window_sizes))
     elif settings.velocity_cap_percentile is not None:
-        finite = vmag[np.isfinite(vmag)]
-        if finite.size:
-            cap = float(np.percentile(finite, 100.0 - float(settings.velocity_cap_percentile)))
-    if not np.isfinite(cap):
+        keep = 100.0 - float(settings.velocity_cap_percentile)
+        vfin = vmag[np.isfinite(vmag)]
+        ufin = umag[np.isfinite(umag)]
+        if vfin.size:
+            vcap = float(np.percentile(vfin, keep))
+        if ufin.size:
+            ucap = float(np.percentile(ufin, keep))
+    if not np.isfinite(ucap) and not np.isfinite(vcap):
         return u, v
-    bad = vmag > cap
+    # NaN cells compare False, so already-masked vectors are left unchanged.
+    bad = (vmag > vcap) | (umag > ucap)
     return np.where(bad, np.nan, u), np.where(bad, np.nan, v)
 
 
@@ -882,6 +958,17 @@ def _cli() -> None:
     p.add_argument("--robustness", default="standard",
                    choices=("standard", "extreme"))
 
+    # Velocity cap — on by default at the 0.7% percentile (drops the top X% of
+    # each of |u| and |v| per frame-pair; a vector is NaN'd if either exceeds).
+    p.add_argument("--velocity-cap-percentile", type=float, default=0.7,
+                   help="drop the top X%% of each component (|u|, |v|); "
+                        "default 0.7")
+    p.add_argument("--velocity-cap-px", type=float, default=None,
+                   help="absolute cap in px/frame applied to both components; "
+                        "overrides the percentile if set")
+    p.add_argument("--no-velocity-cap", action="store_true",
+                   help="disable the velocity cap entirely")
+
     # Pre-processing flags.
     p.add_argument("--no-clahe", action="store_true")
     p.add_argument("--clahe-window", type=int, default=64)
@@ -918,6 +1005,9 @@ def _cli() -> None:
         subpixel_method=args.subpixel,
         disable_autocorrelation=args.disable_autocorrelation,
         correlation_robustness=args.robustness,
+        velocity_cap_px=args.velocity_cap_px,
+        velocity_cap_percentile=(None if args.no_velocity_cap
+                                 else args.velocity_cap_percentile),
     )
     preproc_settings = PreprocSettings(
         enable_clahe=not args.no_clahe,

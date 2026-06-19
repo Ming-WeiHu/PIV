@@ -7,7 +7,7 @@ script).
 Usage
 -----
     # Package style (preferred):
-    python -m piv_pipeline.piv_pipeline_master --input-dir "C:/path/to/Primary Exports"
+    python -m piv_pipeline.piv_pipeline_master --input-dir "/path/to/Primary Exports"
 
     # Or run the file directly:
     python piv_pipeline_master.py --input-dir "..."
@@ -21,7 +21,9 @@ Image folder convention for Stage 2 (mirrors the MATLAB master):
 Override with --images-base PATH if your layout differs:
     <PATH>/<vol>-<angle>-<cpm_str>-imgs/Test1/<vol>-<angle>-<cpm_str>/
 
-To run : "C:/Users/JackHu/OneDrive - Oribiotech Ltd/Desktop/python/.claude/worktrees/focused-kilby-9a7427/run_pipeline.bat" --input-dir "C:/Users/JackHu/OneDrive - Oribiotech Ltd/Desktop/sample data/Test1/firstsave.npz" --skip-masking
+Single-file example (skip the per-frame TIF masking stage):
+    python -m piv_pipeline.piv_pipeline_master \
+        --input-dir "/path/to/Test1/firstsave.npz" --skip-masking
 """
 
 from __future__ import annotations
@@ -103,9 +105,103 @@ def _load_secondary_convert_velocity(sec_path: Path) -> bool | None:
     return None
 
 
+def run_pipeline_for_condition(
+    primary_path, *, images_folder, cfg, out_dir, do_masking,
+    skip_tertiary: bool = False, force=False,
+) -> dict:
+    """Run Stage 1 (secondary) → Stage 2 (dynamic mask, optional) → Stage 3
+    (tertiary) for ONE primary export. Stage 4 (final_analysis) is run once
+    by the caller over all tertiary exports. Returns paths dict.
+
+    When skip_tertiary is True, Stages 1 and 2 run normally but Stage 3 is
+    skipped; result["tertiary_path"] is set to None."""
+    primary_path = Path(primary_path)
+    out_dir = Path(out_dir)
+    sec_dir = out_dir / "Secondary Exports"
+    masks_dir = out_dir / "Dynamic Masks"
+    tert_dir = out_dir / "Tertiary Exports"
+    for d in (sec_dir, masks_dir, tert_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    name_info = parse_filename(primary_path.stem)
+    condition = name_info["condition"]
+    result = {"condition": condition, "secondary_path": None,
+              "mask_path": None, "tertiary_path": None}
+
+    # ---- Stage 1: Secondary Export ----
+    sec_path = sec_dir / f"{condition}_Secondary_Export.npz"
+    if sec_path.exists() and not force:
+        mask_rows, mask_cols = _grid_shape_from_secondary(sec_path)
+    else:
+        primary = load_primary(primary_path)
+        mask_rows, mask_cols = secondary_export(
+            primary,
+            centre_x=cfg["centre_x"], centre_y=cfg["centre_y"],
+            fps=cfg["fps"], AA=cfg["AA"], howstupid=cfg["howstupid"],
+            convert_velocity=cfg["convert_velocity"], nan_fill=cfg["nan_fill"],
+            out_dir=sec_dir, name_info=name_info,
+        )
+    result["secondary_path"] = sec_path
+
+    # ---- Stage 2: Dynamic Masking (optional) ----
+    mask_path = None
+    candidate_mask = masks_dir / f"dynamic_masking_{condition}.npz"
+    if do_masking and images_folder is not None and Path(images_folder).is_dir():
+        if candidate_mask.exists() and not force:
+            mask_path = candidate_mask
+        else:
+            dynamic_masking(
+                Path(images_folder), condition=condition,
+                lower_bound=cfg["lower_bound"],
+                mask_rows=mask_rows, mask_cols=mask_cols, out_dir=masks_dir,
+                method=cfg["mask_method"],
+                texture_ksize=int(cfg["mask_particle_ksize"]),
+                tophat_particle_ksize=int(cfg["mask_particle_ksize"]),
+                tophat_region_ksize=int(cfg["mask_region_ksize"]),
+                tophat_keep_pct=cfg["mask_keep_pct"],
+                simple_threshold=float(cfg["mask_threshold"]),
+                simple_direction=cfg["mask_direction"],
+                deviation_threshold=cfg["mask_deviation_threshold"],
+                morph_open_ksize=int(cfg["mask_open_ksize"]),
+                morph_close_ksize=int(cfg["mask_close_ksize"]),
+                uniform_floor=float(cfg["mask_uniform_floor"]),
+            )
+            mask_path = candidate_mask
+    result["mask_path"] = mask_path
+
+    # ---- Stage 3: Tertiary Export ----
+    if skip_tertiary:
+        print("  [Stage 3] Skipped (skip_tertiary=True).")
+        result["tertiary_path"] = None
+        return result
+    tert_path = tert_dir / f"{condition}_Tertiary_Export.npz"
+    if not (tert_path.exists() and not force):
+        tertiary_export(sec_path, mask_path, R=cfg["R"], out_dir=tert_dir)
+    result["tertiary_path"] = tert_path
+    return result
+
+
+def _apply_cfg_defaults(cfg: dict) -> dict:
+    """Fill in defaults for keys that may be absent from config.yaml. Shared by the CLI and the GUI batch worker."""
+    cfg.setdefault("span", 50)
+    cfg.setdefault("convert_velocity", True)
+    cfg.setdefault("nan_fill", "interpolate")
+    cfg.setdefault("mask_method", "tophat")
+    cfg.setdefault("mask_keep_pct", None)
+    cfg.setdefault("mask_particle_ksize", 15)
+    cfg.setdefault("mask_region_ksize", 31)
+    cfg.setdefault("mask_threshold", 128.0)
+    cfg.setdefault("mask_direction", "above")
+    cfg.setdefault("mask_open_ksize", 7)
+    cfg.setdefault("mask_close_ksize", 41)
+    cfg.setdefault("mask_uniform_floor", 0.0)
+    cfg.setdefault("mask_deviation_threshold", None)
+    return cfg
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="PIV post-processing pipeline (Stages 1+2 wired; Stages 3, 4, videos pending)."
+        description="PIV post-processing pipeline (Stages 1-4 + opt-in videos)."
     )
     parser.add_argument(
         "--input-dir", required=True,
@@ -152,8 +248,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="--make-videos: output frame rate (default 20).")
     parser.add_argument("--vid-step", type=int, default=3,
                         help="--make-videos: sample every Nth frame (default 3).")
-    parser.add_argument("--vid-clim-max", type=float, default=100,
-                        help="--make-videos: shear-rate colour bar max (default 100).")
+    parser.add_argument("--vid-clim-max", type=float, default=30,
+                        help="--make-videos: shear-rate colour bar max (default 30).")
     parser.add_argument(
         "--force", action="store_true",
         help="Recompute even if outputs already exist.",
@@ -210,21 +306,8 @@ def main(argv: list[str] | None = None) -> None:
         v = getattr(args, key)
         if v is not None:
             cfg[key] = v
-    # Defaults for keys we added later
-    cfg.setdefault("span", 50)
-    cfg.setdefault("convert_velocity", True)
-    cfg.setdefault("nan_fill", "interpolate")
-    # Stage 2 mask defaults (config drives these; these are fallbacks only)
-    cfg.setdefault("mask_method", "tophat")
-    cfg.setdefault("mask_keep_pct", None)
-    cfg.setdefault("mask_particle_ksize", 15)
-    cfg.setdefault("mask_region_ksize", 31)
-    cfg.setdefault("mask_threshold", 128.0)
-    cfg.setdefault("mask_direction", "above")
-    cfg.setdefault("mask_open_ksize", 7)
-    cfg.setdefault("mask_close_ksize", 41)
-    cfg.setdefault("mask_uniform_floor", 0.0)
-    cfg.setdefault("mask_deviation_threshold", None)
+    # Defaults for keys we added later (and Stage 2 mask fallbacks)
+    _apply_cfg_defaults(cfg)
 
     input_path = Path(args.input_dir).resolve()
     if not input_path.exists():
@@ -279,126 +362,25 @@ def main(argv: list[str] | None = None) -> None:
 
     for i, f in enumerate(files, start=1):
         print(f"========== [{i}/{len(files)}] {f.name} ==========")
-
         try:
             name_info = parse_filename(f.stem)
         except ValueError as e:
             print(f"  SKIP — {e}")
             continue
-
-        # ---- Stage 1: Secondary Export ------------------------------------
-        sec_path = sec_dir / f"{name_info['condition']}_Secondary_Export.npz"
-        if sec_path.exists() and not args.force:
-            saved_convert_velocity = _load_secondary_convert_velocity(sec_path)
-            if saved_convert_velocity is None:
-                print(
-                    "  [Stage 1] Existing file has no convert_velocity metadata; "
-                    "recomputing."
-                )
-                sec_path.unlink(missing_ok=True)
-            elif saved_convert_velocity != cfg["convert_velocity"]:
-                print(
-                    f"  [Stage 1] Existing file uses convert_velocity={saved_convert_velocity}; "
-                    f"recomputing with convert_velocity={cfg['convert_velocity']}."
-                )
-                sec_path.unlink(missing_ok=True)
-            else:
-                print(f"  [Stage 1] Already exists — skipping (use --force to recompute).")
-                try:
-                    mask_rows, mask_cols = _grid_shape_from_secondary(sec_path)
-                except Exception as e:
-                    print(f"  [Stage 1] Existing file unreadable ({e}) — recomputing.")
-                    sec_path.unlink(missing_ok=True)
-                    primary = load_primary(f)
-                    mask_rows, mask_cols = secondary_export(
-                        primary,
-                        centre_x=cfg["centre_x"], centre_y=cfg["centre_y"],
-                        fps=cfg["fps"], AA=cfg["AA"], howstupid=cfg["howstupid"],
-                        convert_velocity=cfg["convert_velocity"],
-                        nan_fill=cfg["nan_fill"],
-                        out_dir=sec_dir, name_info=name_info,
-                    )
-        if not sec_path.exists():
-            print(f"  [Stage 1] Loading {f.name}...")
-            primary = load_primary(f)
-            print(
-                f"            n_pairs={primary['n_pairs']}  "
-                f"grid={primary['x'].shape}  source={primary['source']}"
+        imgs_folder_arg = None
+        if not args.skip_masking:
+            imgs_folder_arg = _find_images_folder(
+                input_dir, name_info, images_base, images_folder
             )
-            mask_rows, mask_cols = secondary_export(
-                primary,
-                centre_x=cfg["centre_x"], centre_y=cfg["centre_y"],
-                fps=cfg["fps"], AA=cfg["AA"], howstupid=cfg["howstupid"],
-                convert_velocity=cfg["convert_velocity"],
-                nan_fill=cfg["nan_fill"],
-                out_dir=sec_dir, name_info=name_info,
-            )
-
-        # typevector in the secondary export captures it. Stage 2 is only
-        # needed when you want PER-FRAME dynamic masking from raw TIFs.
-        candidate_mask = masks_dir / f"dynamic_masking_{name_info['condition']}.npz"
-        mask_path: Path | None = None
-
-        if args.skip_masking:
-            print("  [Stage 2] Skipped (--skip-masking) — Stage 3 will use typevector-only mask.")
-        elif candidate_mask.exists() and not args.force:
-            print(f"  [Stage 2] Already exists — skipping.")
-            mask_path = candidate_mask
-        else:
-            imgs_folder = _find_images_folder(input_dir, name_info, images_base, images_folder)
-            if not imgs_folder.is_dir():
-                print(
-                    f"  [Stage 2] No TIF folder at: {imgs_folder}\n"
-                    f"            Falling back to typevector-only mask in Stage 3.\n"
-                    f"            Pass --images-folder PATH to enable Stage 2."
-                )
-            else:
-                try:
-                    print(f"  [Stage 2] method={cfg['mask_method']} "
-                          f"ksize={cfg['mask_particle_ksize']} "
-                          f"thr={cfg['mask_threshold']} dir={cfg['mask_direction']} "
-                          f"open={cfg['mask_open_ksize']} close={cfg['mask_close_ksize']} "
-                          f"keep_pct={cfg['mask_keep_pct']} uniform_floor={cfg['mask_uniform_floor']}")
-                    dynamic_masking(
-                        imgs_folder,
-                        condition=name_info["condition"],
-                        lower_bound=cfg["lower_bound"],
-                        mask_rows=mask_rows, mask_cols=mask_cols,
-                        out_dir=masks_dir,
-                        method=cfg["mask_method"],
-                        texture_ksize=int(cfg["mask_particle_ksize"]),
-                        tophat_particle_ksize=int(cfg["mask_particle_ksize"]),
-                        tophat_region_ksize=int(cfg["mask_region_ksize"]),
-                        tophat_keep_pct=cfg["mask_keep_pct"],
-                        simple_threshold=float(cfg["mask_threshold"]),
-                        simple_direction=cfg["mask_direction"],
-                        deviation_threshold=cfg["mask_deviation_threshold"],
-                        morph_open_ksize=int(cfg["mask_open_ksize"]),
-                        morph_close_ksize=int(cfg["mask_close_ksize"]),
-                        uniform_floor=float(cfg["mask_uniform_floor"]),
-                    )
-                    mask_path = candidate_mask
-                except FileNotFoundError as e:
-                    print(f"  [Stage 2] FAILED — {e}")
-
-        # ---- Stage 3: Tertiary Export -------------------------------------
-        if args.skip_tertiary:
-            print("  [Stage 3] Skipped (--skip-tertiary).\n")
-            continue
-
-        tert_path = tert_dir / f"{name_info['condition']}_Tertiary_Export.npz"
-        if tert_path.exists() and not args.force:
-            print(f"  [Stage 3] Already exists — skipping.\n")
-            continue
-
         try:
-            tertiary_export(
-                sec_path, mask_path,         # mask_path is None → typevector-only
-                R=cfg["R"],
-                out_dir=tert_dir,
+            run_pipeline_for_condition(
+                f, images_folder=imgs_folder_arg, cfg=cfg, out_dir=out_root,
+                do_masking=not args.skip_masking,
+                skip_tertiary=args.skip_tertiary,
+                force=args.force,
             )
-        except FileNotFoundError as e:
-            print(f"  [Stage 3] FAILED — {e}\n")
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  FAILED — {e}")
             continue
         print()
 

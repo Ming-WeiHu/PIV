@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import cv2
 import numpy as np
 from scipy.interpolate import griddata
+from scipy.ndimage import binary_fill_holes
 from tqdm import tqdm
 
 
@@ -54,9 +55,40 @@ def _render_frame(
     ax.set_facecolor("white")
     fig.patch.set_facecolor("white")
 
+    # Interpolate NaN holes in shear before plotting (masked/capped cells).
+    # Only fill *interior* holes — cells enclosed by valid data. The mask
+    # interior is `binary_fill_holes(valid)`; everything outside it (the region
+    # beyond the mask, and concave notches the convex-hull interpolation would
+    # otherwise bleed into) is forced back to NaN so it never extends past the
+    # mask boundary.
+    shear_plot = shear.copy()
+    valid = np.isfinite(shear_plot)
+    fill_region = binary_fill_holes(valid)
+    nan_mask = ~valid
+    if nan_mask.any() and valid.sum() > 10:
+        try:
+            pts = np.column_stack([X_norm[valid], Y_norm[valid]])
+            shear_plot[nan_mask] = griddata(
+                pts, shear[valid],
+                (X_norm[nan_mask], Y_norm[nan_mask]),
+                method="linear",
+            )
+            # Any remaining NaN inside the mask (outside convex hull) → nearest
+            still_nan = ~np.isfinite(shear_plot)
+            if still_nan.any():
+                shear_plot[still_nan] = griddata(
+                    pts, shear[valid],
+                    (X_norm[still_nan], Y_norm[still_nan]),
+                    method="nearest",
+                )
+        except Exception:
+            pass
+    # Clamp back to the mask: drop anything the interpolation pushed past it.
+    shear_plot[~fill_region] = np.nan
+
     # pcolor (shading='gouraud' ≈ MATLAB 'FaceColor', 'interp')
     pcm = ax.pcolormesh(
-        X_norm, Y_norm, shear,
+        X_norm, Y_norm, shear_plot,
         shading="gouraud", cmap="jet",
         vmin=0, vmax=clim_max,
     )
@@ -69,12 +101,17 @@ def _render_frame(
 
     # Streamlines from masked velocity — interpolate over masked holes first.
     # Optional: skip silently if it fails for this frame (mirrors MATLAB try/catch).
-    valid = np.isfinite(uc) & np.isfinite(vc)
-    if valid.sum() > 10:
+    vel_valid = np.isfinite(uc) & np.isfinite(vc)
+    if vel_valid.sum() > 10:
         try:
-            pts = np.column_stack([X_norm[valid], Y_norm[valid]])
-            uc_i = griddata(pts, uc[valid], (X_norm, Y_norm), method="linear")
-            vc_i = griddata(pts, vc[valid], (X_norm, Y_norm), method="linear")
+            vel_region = binary_fill_holes(vel_valid)
+            pts = np.column_stack([X_norm[vel_valid], Y_norm[vel_valid]])
+            uc_i = griddata(pts, uc[vel_valid], (X_norm, Y_norm), method="linear")
+            vc_i = griddata(pts, vc[vel_valid], (X_norm, Y_norm), method="linear")
+            # Keep streamlines inside the mask — NaN elsewhere so streamplot
+            # draws nothing past the boundary.
+            uc_i[~vel_region] = np.nan
+            vc_i[~vel_region] = np.nan
 
             # streamplot requires strictly increasing 1D x / y.
             if Y_norm[0, 0] > Y_norm[-1, 0]:
@@ -99,7 +136,7 @@ def generate_videos(
     *,
     vid_fps: float = 30,
     step: int = 3,
-    clim_max: float = 100,
+    clim_max: float = 30,
 ) -> Path:
     """Render an MP4 per *_Tertiary_Export.npz in `tert_dir`.
 
@@ -200,8 +237,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Output video frame rate (default 30).")
     parser.add_argument("--step", type=int, default=3,
                         help="Sample every Nth source frame (default 3).")
-    parser.add_argument("--clim-max", type=float, default=100,
-                        help="Shear-rate colour bar upper limit, 1/s (default 100).")
+    parser.add_argument("--clim-max", type=float, default=30,
+                        help="Shear-rate colour bar upper limit, 1/s (default 30).")
     args = parser.parse_args(argv)
 
     generate_videos(

@@ -31,6 +31,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from PIL import Image, ImageTk
 
 import piv_simple as ps
+from piv_pipeline.io_loaders import parse_filename
 
 
 # ───────────────────────────── styling ───────────────────────────────────────
@@ -64,6 +65,23 @@ def list_image_folder(folder: str,
     files = [f for f in p.iterdir()
              if f.is_file() and f.suffix.lower() in exts]
     return sorted(files, key=lambda f: natural_key(f.name))
+
+
+def collect_conditions(parent_dir):
+    """Return ([{condition,name,folder,images}], skipped_names) for each
+    subfolder whose name parses as a PIV condition and holds ≥2 images."""
+    parent = Path(parent_dir)
+    conds, skipped = [], []
+    for sub in sorted(p for p in parent.iterdir() if p.is_dir()):
+        info = parse_filename(sub.name)
+        if not info.get("strict"):
+            skipped.append(sub.name); continue
+        imgs = list_image_folder(sub)
+        if len(imgs) < 2:
+            skipped.append(sub.name); continue
+        conds.append({"condition": info["condition"], "name": sub.name,
+                      "folder": sub, "images": imgs})
+    return conds, skipped
 
 
 def pair_indices(n: int, mode: str) -> List[Tuple[int, int]]:
@@ -132,6 +150,59 @@ def load_image_full_uint8(path: str) -> np.ndarray:
     return img
 
 
+# ──────────────────────── primary-npz I/O ────────────────────────────────────
+
+def save_primary_npz(out_path, x, y, u_orig, v_orig, cal, in_world_units):
+    """Write the canonical 7-key PIVlab-style primary .npz (pixel units)."""
+    if in_world_units:
+        x_px = ((x - cal.x_offset_m) / cal.m_per_pixel) * cal.x_sign
+        y_px = ((y - cal.y_offset_m) / cal.m_per_pixel) * cal.y_sign
+        uvs = cal.m_per_second_per_px_per_frame
+        u = u_orig / uvs * cal.x_sign
+        v = v_orig / uvs * cal.y_sign
+    else:
+        x_px, y_px, u, v = x, y, u_orig, v_orig
+    import numpy as _np
+    _np.savez(
+        out_path,
+        calxy=_np.float64(cal.m_per_pixel),
+        calu=_np.float64(cal.m_per_second_per_px_per_frame * cal.x_sign),
+        calv=_np.float64(cal.m_per_second_per_px_per_frame * cal.y_sign),
+        x=x_px.astype(_np.float32),
+        y=y_px.astype(_np.float32),
+        u_original=u.astype(_np.float32),
+        v_original=v.astype(_np.float32),
+    )
+
+
+def run_piv_sequence(file_list, pairs, piv_s, preproc_s, bg, mask, calibration,
+                     progress_cb=None, cancel_check=None):
+    """Run PIV over the given index pairs; return stacked arrays or None."""
+    import numpy as _np
+    us, vs, us_o, vs_o = [], [], [], []
+    x_grid = y_grid = None
+    for k, (i, j) in enumerate(pairs):
+        if cancel_check is not None and cancel_check():
+            break
+        fa = ps._load_image(str(file_list[i]))
+        fb = ps._load_image(str(file_list[j]))
+        x, y, u, v, u_o, v_o = ps.run_piv(
+            fa, fb, piv_s, preproc_s, bg, calibration, mask, return_originals=True)
+        if x_grid is None:
+            x_grid, y_grid = x, y
+        us.append(u); vs.append(v); us_o.append(u_o); vs_o.append(v_o)
+        if progress_cb is not None:
+            progress_cb(k + 1, len(pairs), i, j)
+    if not us:
+        return None
+    return {
+        "x": x_grid, "y": y_grid,
+        "u": _np.stack(us, 0), "v": _np.stack(vs, 0),
+        "u_original": _np.stack(us_o, 0), "v_original": _np.stack(vs_o, 0),
+        "pairs": pairs[:len(us)],
+    }
+
+
 # ─────────────────────────── small UI helpers ────────────────────────────────
 
 def labeled_entry(parent, label, var, width=10):
@@ -192,11 +263,28 @@ class PIVGUI:
         self.subpixel = tk.StringVar(value="gauss2x3")
         self.disable_autocorr = tk.BooleanVar(value=False)
         self.robustness = tk.StringVar(value="standard")
-        # Velocity cap (vector validation) — ON by default.
-        # Default = absolute |v| cap of 5.4 px/frame (the validated global cut).
+        # Velocity cap (vector validation) — ON by default, matching
+        # piv_simple's PIVSettings default. Rejects a vector when EITHER
+        # component exceeds the cap (|u| OR |v|). Preset = absolute cap of
+        # 5.4 px/frame (the validated global cut); the 0.70% percentile is the
+        # alternative used when px=0.
         self.cap_enabled = tk.BooleanVar(value=True)
-        self.cap_px = tk.DoubleVar(value=5.4)           # absolute |v| cap, px/frame
-        self.cap_percentile = tk.DoubleVar(value=0.70)  # alt: drop top X% by |v| (use when px=0)
+        self.cap_px = tk.DoubleVar(value=5.4)           # absolute |u|/|v| cap, px/frame
+        self.cap_percentile = tk.DoubleVar(value=0.70)  # alt: drop top X% of each |u|/|v| (use when px=0)
+
+        # PIVlab-style robust smoothn on the final field (independent of the cap)
+        self.smoothn_enabled = tk.BooleanVar(value=False)
+
+        # Batch (multi-condition) vars
+        self.batch_parent = tk.StringVar(value="")
+        self.batch_out = tk.StringVar(value="")
+        self.batch_masking = tk.BooleanVar(value=True)
+        self.cfg_fps = tk.StringVar(value="")
+        self.cfg_AA = tk.StringVar(value="")
+        self.cfg_R = tk.StringVar(value="")
+        self.cfg_span = tk.StringVar(value="")
+        self.cfg_centre_x = tk.StringVar(value="")
+        self.cfg_centre_y = tk.StringVar(value="")
 
         # Pre-processing vars
         self.pp_clahe = tk.BooleanVar(value=True)
@@ -543,14 +631,43 @@ class PIVGUI:
         # displacement limit; mimics PIVlab's search-area-bounded output).
         vc = ttk.LabelFrame(outer, text="Vector validation (velocity cap)")
         vc.pack(fill="x", padx=4, pady=4)
-        ttk.Checkbutton(vc, text="Reject vectors above |v| cap",
+        ttk.Checkbutton(vc, text="Reject vectors above |u| or |v| cap",
                         variable=self.cap_enabled).pack(anchor="w", padx=6, pady=(4, 2))
         row = ttk.Frame(vc, style="Panel.TFrame"); row.pack(fill="x", padx=6, pady=2)
-        ttk.Label(row, text="max |v| px/frame (validated 5.4):").pack(side="left")
+        ttk.Label(row, text="max |u|/|v| px/frame (validated 5.4):").pack(side="left")
         ttk.Entry(row, textvariable=self.cap_px, width=6).pack(side="left", padx=4)
         row = ttk.Frame(vc, style="Panel.TFrame"); row.pack(fill="x", padx=6, pady=2)
-        ttk.Label(row, text="or top % by |v| (used when px=0):").pack(side="left")
+        ttk.Label(row, text="or top % of each |u|/|v| (used when px=0):").pack(side="left")
         ttk.Entry(row, textvariable=self.cap_percentile, width=6).pack(side="left", padx=4)
+
+        # Field smoothing — PIVlab-style robust smoothn on the final field
+        # (independent of the cap; toggle either to compare their effect).
+        sm = ttk.LabelFrame(outer, text="Field smoothing (smoothn)")
+        sm.pack(fill="x", padx=4, pady=4)
+        ttk.Checkbutton(sm, text="Per-pass smoothn (PIVlab-style: s=4, auto last pass)",
+                        variable=self.smoothn_enabled).pack(anchor="w", padx=6, pady=4)
+
+        # Batch (multi-condition pipeline)
+        bf = ttk.LabelFrame(outer, text="Batch (multi-condition pipeline)")
+        bf.pack(fill="x", padx=4, pady=4)
+        row = ttk.Frame(bf, style="Panel.TFrame"); row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row, text="Parent folder:").pack(side="left")
+        ttk.Entry(row, textvariable=self.batch_parent).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row, text="Browse", command=self._browse_batch_parent).pack(side="left")
+        row = ttk.Frame(bf, style="Panel.TFrame"); row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(row, text="Output root:").pack(side="left")
+        ttk.Entry(row, textvariable=self.batch_out).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row, text="Browse", command=self._browse_batch_out).pack(side="left")
+        ttk.Checkbutton(bf, text="Dynamic masking (Stage 2) — requires TIF frames",
+                        variable=self.batch_masking).pack(anchor="w", padx=6, pady=2)
+        ov = ttk.Frame(bf, style="Panel.TFrame"); ov.pack(fill="x", padx=6, pady=2)
+        for lbl, var in (("fps", self.cfg_fps), ("AA", self.cfg_AA), ("R", self.cfg_R),
+                         ("span", self.cfg_span), ("cx", self.cfg_centre_x), ("cy", self.cfg_centre_y)):
+            ttk.Label(ov, text=lbl).pack(side="left")
+            ttk.Entry(ov, textvariable=var, width=6).pack(side="left", padx=(2, 8))
+        ttk.Label(bf, text="(override fields blank = use config.yaml)").pack(anchor="w", padx=6)
+        ttk.Button(bf, text="Run batch pipeline", command=self._run_batch).pack(anchor="w", padx=6, pady=4)
+        ttk.Button(bf, text="Run PIV + pipeline (this folder)", command=self._run_single_pipeline).pack(anchor="w", padx=6, pady=4)
 
     # ── Pre-processing panel ─────────────────────────────────────────────────
 
@@ -733,6 +850,18 @@ class PIVGUI:
             self._show_preview_path(p)
             self._log(f"Calibration image: {p}")
 
+    def _browse_batch_parent(self):
+        d = filedialog.askdirectory(title="Parent folder of condition subfolders")
+        if d:
+            self.batch_parent.set(d)
+            if not self.batch_out.get():
+                self.batch_out.set(d)
+
+    def _browse_batch_out(self):
+        d = filedialog.askdirectory(title="Output root")
+        if d:
+            self.batch_out.set(d)
+
     # ─────────────────────── settings → dataclasses ──────────────────────────
 
     def _piv_settings(self) -> ps.PIVSettings:
@@ -765,6 +894,7 @@ class PIVGUI:
             velocity_cap_px=velocity_cap_px,
             velocity_cap_fraction=None,
             velocity_cap_percentile=velocity_cap_percentile,
+            enable_smoothn=self.smoothn_enabled.get(),
         )
 
     def _preproc_settings(self) -> ps.PreprocSettings:
@@ -1090,48 +1220,134 @@ class PIVGUI:
             if mask is not None:
                 self._log(f"Mask: keep fraction = {float(mask.mean()):.3f}")
 
-            us, vs, us_orig, vs_orig = [], [], [], []
-            x_grid, y_grid = None, None
-            for k, (i, j) in enumerate(pairs):
-                if self.cancel_flag.is_set():
-                    self._log(f"Cancelled at pair {k}/{len(pairs)}.")
-                    break
-                t0 = time.time()
-                fa = ps._load_image(str(self.file_list[i]))
-                fb = ps._load_image(str(self.file_list[j]))
-                x, y, u, v, u_o, v_o = ps.run_piv(
-                    fa, fb, piv_s, preproc_s, bg, calibration, mask,
-                    return_originals=True)
-                if x_grid is None:
-                    x_grid, y_grid = x, y
-                us.append(u);      vs.append(v)
-                us_orig.append(u_o); vs_orig.append(v_o)
-                dt = time.time() - t0
-                self._log(f"  pair {k + 1:3d}/{len(pairs)}  "
-                          f"({self.file_list[i].name} -> {self.file_list[j].name})  "
-                          f"{dt:.2f}s")
-                self.root.after(0, self._update_progress, k + 1, len(pairs), i, j)
-            if us:
-                self.results_x = x_grid
-                self.results_y = y_grid
-                self.results_u = np.stack(us, axis=0)
-                self.results_v = np.stack(vs, axis=0)
-                self.results_u_original = np.stack(us_orig, axis=0)
-                self.results_v_original = np.stack(vs_orig, axis=0)
-                self.results_pairs = pairs[:len(us)]
+            res = run_piv_sequence(
+                self.file_list, pairs, piv_s, preproc_s, bg, mask, calibration,
+                progress_cb=lambda d, t, i, j: self.root.after(0, self._update_progress, d, t, i, j),
+                cancel_check=self.cancel_flag.is_set)
+            if res:
+                self.results_x = res["x"]; self.results_y = res["y"]
+                self.results_u = res["u"]; self.results_v = res["v"]
+                self.results_u_original = res["u_original"]
+                self.results_v_original = res["v_original"]
+                self.results_pairs = res["pairs"]
                 self.results_in_world_units = calibration is not None
                 unit = "m/s" if calibration else "px/frame"
                 mean_mag = float(np.nanmean(
                     np.hypot(self.results_u, self.results_v)))
                 n_valid = int(np.isfinite(self.results_u).sum())
                 n_total = self.results_u.size
-                self._log(f"Done. {len(us)} pairs processed. "
+                self._log(f"Done. {len(self.results_pairs)} pairs processed. "
                           f"Field shape per pair: {self.results_u.shape[1:]}  "
                           f"mean |V| = {mean_mag:.4f} {unit}  "
                           f"valid = {n_valid}/{n_total}")
                 self.root.after(0, self._show_pair_overlay, 0)
+            if self.cancel_flag.is_set():
+                done = len(res["pairs"]) if res else 0
+                self._log(f"Cancelled. {done}/{len(pairs)} pairs completed.")
         except Exception:
             self._log("Analysis failed:\n" + traceback.format_exc())
+        finally:
+            self.root.after(0, self._finish_run)
+
+    def _run_batch(self):
+        if self.is_running:
+            return
+        parent = self.batch_parent.get().strip()
+        if not parent or not Path(parent).is_dir():
+            messagebox.showwarning("PIV batch", "Pick a valid parent folder.")
+            return
+        conds, skipped = collect_conditions(parent)
+        if not conds:
+            messagebox.showwarning("PIV batch", "No valid condition subfolders found.")
+            return
+        if skipped:
+            self._log(f"Skipping (bad name / <2 images): {', '.join(skipped)}")
+        self._start_batch(conds)
+
+    def _start_batch(self, conds):
+        self.cancel_flag.clear()
+        self.is_running = True
+        self.run_start_time = time.time()
+        self.run_btn.config(state="disabled")
+        self.progress.config(maximum=len(conds), value=0)
+        self._log("─" * 70)
+        self._log(f"Batch: {len(conds)} condition(s)")
+        threading.Thread(target=self._batch_worker, args=(conds,), daemon=True).start()
+
+    def _run_single_pipeline(self):
+        if self.is_running:
+            return
+        if not self.file_list or len(self.file_list) < 2:
+            messagebox.showwarning("PIV", "Load an image folder with at least 2 images first.")
+            return
+        folder = self.file_list[0].parent
+        name = folder.name
+        condition = parse_filename(name)["condition"]
+        cond = {"condition": condition, "name": name, "folder": folder, "images": list(self.file_list)}
+        if not self.batch_out.get().strip() and not self.batch_parent.get().strip():
+            self.batch_out.set(str(folder.parent))
+        self._log(f"Single-condition pipeline: {name}")
+        self._start_batch([cond])
+
+    def _batch_worker(self, conds):
+        from piv_pipeline.piv_pipeline_master import run_pipeline_for_condition, _load_config, _apply_cfg_defaults
+        from piv_pipeline.fn_final_analysis import final_analysis
+        try:
+            cfg = _load_config(None)
+            for key, var, cast in (("fps", self.cfg_fps, float), ("AA", self.cfg_AA, int),
+                                   ("R", self.cfg_R, float), ("span", self.cfg_span, int),
+                                   ("centre_x", self.cfg_centre_x, float),
+                                   ("centre_y", self.cfg_centre_y, float)):
+                s = var.get().strip()
+                if s:
+                    cfg[key] = cast(s)
+            cfg = _apply_cfg_defaults(cfg)
+            out_root = Path(self.batch_out.get().strip() or self.batch_parent.get().strip())
+
+            piv_s = self._piv_settings()
+            preproc_s = self._preproc_settings()
+            calibration = self._calibration_settings() if self.cal_applied.get() else None
+            bg = ps._load_image(self.bg_path.get()) if self.bg_path.get() else None
+            mask = ps.load_mask(self.mask_path.get()) if self.mask_path.get() else None
+
+            ok, failed = [], []
+            for ci, c in enumerate(conds):
+                if self.cancel_flag.is_set():
+                    self._log(f"Batch stopped (cancelled). OK={len(ok)} failed={len(failed)}"); break
+                self._log(f"[{ci+1}/{len(conds)}] {c['name']}  ({len(c['images'])} frames)")
+                try:
+                    pairs = pair_indices(len(c["images"]), self.pair_mode.get())
+                    res = run_piv_sequence(c["images"], pairs, piv_s, preproc_s,
+                                           bg, mask, calibration,
+                                           cancel_check=self.cancel_flag.is_set)
+                    if not res:
+                        failed.append((c["name"], "no pairs")); continue
+                    prim = out_root / f"{c['name']}.npz"
+                    save_primary_npz(prim, res["x"], res["y"], res["u_original"],
+                                     res["v_original"], calibration or self._calibration_settings(),
+                                     calibration is not None)
+                    run_pipeline_for_condition(
+                        prim, images_folder=c["folder"], cfg=cfg, out_dir=out_root,
+                        do_masking=self.batch_masking.get(), force=True)
+                    ok.append(c["name"])
+                except Exception as e:
+                    self._log(f"  FAILED {c['name']}: {e}")
+                    failed.append((c["name"], str(e)))
+                self.root.after(0, lambda v=ci + 1: self.progress.config(value=v))
+
+            if ok and not self.cancel_flag.is_set():
+                self._log("Stage 4: final_analysis over all tertiary exports…")
+                try:
+                    final_analysis(out_root / "Tertiary Exports",
+                                   out_root / "Summary", span=int(cfg["span"]))
+                except Exception as e:
+                    self._log(f"  Stage 4 FAILED: {e}")
+            if not self.cancel_flag.is_set():
+                self._log(f"Batch done. OK={len(ok)}  failed={len(failed)}")
+            for name, why in failed:
+                self._log(f"  - {name}: {why}")
+        except Exception:
+            self._log("Batch failed:\n" + traceback.format_exc())
         finally:
             self.root.after(0, self._finish_run)
 
@@ -1276,29 +1492,18 @@ class PIVGUI:
 
         cal = self._calibration_settings()
 
-        # Roll back any run-time calibration so x/y/u/v on disk are in pixels.
+        save_primary_npz(out_path, self.results_x, self.results_y,
+                         self.results_u_original, self.results_v_original,
+                         cal, self.results_in_world_units)
+
+        # Reconstruct x_px / u_orig for the log message.
         if self.results_in_world_units:
             x_px = ((self.results_x - cal.x_offset_m) / cal.m_per_pixel) * cal.x_sign
-            y_px = ((self.results_y - cal.y_offset_m) / cal.m_per_pixel) * cal.y_sign
             uvs = cal.m_per_second_per_px_per_frame
             u_orig = self.results_u_original / uvs * cal.x_sign
-            v_orig = self.results_v_original / uvs * cal.y_sign
         else:
             x_px = self.results_x
-            y_px = self.results_y
             u_orig = self.results_u_original
-            v_orig = self.results_v_original
-
-        np.savez(
-            out_path,
-            calxy=np.float64(cal.m_per_pixel),
-            calu=np.float64(cal.m_per_second_per_px_per_frame * cal.x_sign),
-            calv=np.float64(cal.m_per_second_per_px_per_frame * cal.y_sign),
-            x=x_px.astype(np.float32),
-            y=y_px.astype(np.float32),
-            u_original=u_orig.astype(np.float32),
-            v_original=v_orig.astype(np.float32),
-        )
         self._log(
             f"Saved → {out_path}\n"
             f"  calxy={cal.m_per_pixel:.4e} m/px  "
