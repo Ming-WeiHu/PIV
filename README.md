@@ -29,11 +29,8 @@ The key output metric is **`TimeAvg_mean`** (time-averaged mean shear rate, 1/s)
 - **`piv_openpiv.py`** — OpenPIV-based alternative processor
 - **`smoothn.py`** — vendored Garcia (2010) robust smoother (faithful port of PIVlab's `smoothn`); used by `piv_simple` for per-pass field smoothing
 
-### GUIs
+### GUI
 - **`piv_gui.py`** — Main Tkinter front-end. Runs PIV on an image folder, and now also runs the **full 4-stage pipeline end-to-end**: a **batch** mode (point at a parent folder of `vol-deg-cpm`-named condition subfolders → one combined `results_rock.csv`) and a **single-condition** button (runs the currently-loaded folder through PIV → pipeline). Both reuse the same `run_pipeline_for_condition` runner as the CLI, so GUI and CLI stay in lockstep.
-- **`cap_pipeline_finder_gui.py`** — **Primary shear tool.** Runs the real 4-stage pipeline at a chosen velocity cap, reads `TimeAvg_mean` from `results_rock.csv`, and plots TimeAvg_mean vs cap with a ±10% MATLAB baseline band. Also has a 3-panel chart window comparing Python vs MATLAB S33, |v|, and |u| per frame.
-- **`cap_explorer_gui.py`** — Lightweight interactive cap slider; shear preview is Stage-1 only (approximate, not pipeline-faithful). Use as a quick sanity check, not for final numbers.
-- **`cap_explorer_advanced_gui.py`** — More complex explorer (not the default; use the finder instead).
 
 ### Post-PIVlab Pipeline (`piv_pipeline/`)
 | File | Role |
@@ -100,7 +97,7 @@ Shear (`TimeAvg_mean`) is driven by **masking**, not by the `nan_fill` setting. 
 Use `nan_fill: interpolate` (default) — this matches PIVlab's own approach.
 
 ### Velocity cap
-Capping removes fast vectors (typically ~7% on average, up to ~28% at rocking peaks). Because fast vectors tend to be low-shear flow cores, capping *raises* average shear. The cap is **on by default** (`velocity_cap_percentile = 0.7` — drop the top 0.7% of each component, computed **per frame-pair**) and rejects a vector when **either** `|u|` **or** `|v|` exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags `--velocity-cap-percentile` / `--velocity-cap-px` / `--no-velocity-cap`.
+Capping removes fast vectors. Because fast vectors tend to be low-shear flow cores, capping *raises* average shear. The cap is **on by default** (`velocity_cap_percentile = 0.7` — drop the top 0.7% of each component, computed **per frame-pair**) and rejects a vector when **either** `|u|` **or** `|v|` exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags `--velocity-cap-percentile` / `--velocity-cap-px` / `--no-velocity-cap`.
 
 ### Field smoothing (smoothn)
 PIVlab smooths the velocity field at the end of **every pass** (before the next image deformation), and this matches its `+piv/piv_FFTmulti.m`: non-robust Garcia `smoothn` with a fixed `s=4` on intermediate passes and auto-GCV on the last pass (the last-pass smoothed field is what's exported). `piv_simple.py` mirrors this exactly via `smoothn.py`, applied after the per-pass outlier replacement (so it's deliberately **non-robust** — validation is already done upstream). It suppresses spurious high-velocity vectors at their source rather than clipping them like the cap. **On by default** (`PIVSettings.enable_smoothn`), independent of the velocity cap — toggle either (GUI checkbox) to A/B their effect on shear.
@@ -126,8 +123,3 @@ tkinter  (stdlib)
 
 ---
 
-## Notes
-
-- This PIV pipeline is **independent** from the bioreactor particle analyzer (`gui.py` / `particle_testing.py`). Do not mix them.
-- The canonical working branch is `claude/piv-consolidated`.
-- MATLAB Secondary Export reference file: `100mL-20deg-35cpm_Secondary_Export.mat` (v7.3 HDF5). S33 shape in h5py is `(frames, cols, rows)` — transpose to `(rows, cols, frames)` before use.
