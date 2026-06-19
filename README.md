@@ -88,7 +88,7 @@ Shear (`TimeAvg_mean`) is driven by **masking**, not by the `nan_fill` setting. 
 Use `nan_fill: interpolate` (default) — this matches PIVlab's own approach.
 
 ### Velocity cap
-Capping removes fast vectors (typically ~7% on average, up to ~28% at rocking peaks). Because fast vectors tend to be low-shear flow cores, capping *raises* average shear. The cap is **on by default** (`velocity_cap_percentile = 0.7` — drop the top 0.7% of each component, computed **per frame-pair**) and rejects a vector when **either** `|u|` **or** `|v|` exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags `--velocity-cap-percentile` / `--velocity-cap-px` / `--no-velocity-cap`.
+Capping removes fast vectors. Because fast vectors tend to be low-shear flow cores, capping *raises* average shear. The cap is **on by default** (`velocity_cap_percentile = 0.7` — drop the top 0.7% of each component, computed **per frame-pair**) and rejects a vector when **either** `|u|` **or** `|v|` exceeds its threshold. Disable/retune via the GUI checkbox or the CLI flags `--velocity-cap-percentile` / `--velocity-cap-px` / `--no-velocity-cap`.
 
 ### Field smoothing (smoothn)
 `smoothn.py` is a vendored port of Garcia (2010)'s DCT-based smoother, the same algorithm PIVlab uses per-pass. It is available in `piv_simple.py` via `PIVSettings.enable_smoothn` but is **off by default** — in a heavily masked field (large NaN regions at vessel walls), smoothn extrapolates into the masked boundary and can inflate velocities in adjacent valid cells. Toggle on via the GUI checkbox to experiment; for production runs use the velocity cap instead.
